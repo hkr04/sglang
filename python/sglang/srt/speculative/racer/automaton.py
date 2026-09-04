@@ -65,13 +65,16 @@ class _CandidateTrie:
 
 
 class RacerAutomaton:
-    """Pure-Python port of the original RACER C++ Automaton/TokenBin semantics.
+    """Pure-Python port of RACER with a fixed-K SGLang adaptation.
 
-    The serving worker keeps one instance per request.  The implementation is
-    intentionally fidelity-first: retrieval-tree selection, AC fail transitions,
-    TokenBin breadth propagation, and the split of the K-node budget match the
-    original C++ implementation.  A final padding path is only a defensive guard
-    for SGLang's fixed-K verify ABI and should not be used in the normal path.
+    Retrieval-tree selection, AC transitions, TokenBin breadth propagation, and
+    the first TokenBin budget match the original C++ implementation.  The C++
+    implementation may return fewer than K unique nodes after candidate-trie
+    merging because its budget is charged before token-identical paths from
+    different borders are merged.  SGLang's NGRAM verify ABI requires exactly K
+    nodes, so this port performs one additional full-K TokenBin refill pass when
+    the original proposal under-fills after merging.  Retrieval-tree nodes are
+    inserted first and are never displaced by this refill.
     """
 
     def __init__(
@@ -164,13 +167,7 @@ class RacerAutomaton:
         self._cur_state = state
 
     def sync_history(self, tokens: Sequence[int]) -> None:
-        """Synchronize the AC state to context immediately before next_token.
-
-        Original RACER inserts all prompt n-grams, then after every accepted step
-        inserts the newly exposed n-grams and advances the AC state.  Rebuilding
-        fail links after incremental insertions gives the same retrieval semantics
-        while keeping this first SGLang port simple and deterministic.
-        """
+        """Synchronize the AC state to context immediately before next_token."""
 
         tokens = [int(x) for x in tokens]
         common = 0
@@ -179,7 +176,6 @@ class RacerAutomaton:
             common += 1
 
         if common != len(self._history):
-            # Request context was rewound/replaced. Reconstruct exactly from it.
             token_bin = self._token_bin
             self.root = _TrieNode()
             self.root.fail = self.root
@@ -204,7 +200,6 @@ class RacerAutomaton:
     def update_logits(
         self, tokens: Sequence[int], topk_ids: Sequence[Sequence[int]]
     ) -> None:
-        # Original TokenBin is keyed only by token id; latest observation wins.
         for token, row in zip(tokens, topk_ids):
             values = [int(x) for x in row[: self.topk]]
             if len(values) < self.topk:
@@ -212,8 +207,6 @@ class RacerAutomaton:
             self._token_bin[int(token)] = values
 
     def _token_bin_row(self, token: int) -> list[int]:
-        # C++ TokenBin preallocates the whole matrix with zeros.  Missing entries
-        # therefore behave as a top-k row of zero token ids.
         return self._token_bin.get(int(token), [0] * self.topk)
 
     def _token_bin_retrieve(
@@ -224,7 +217,6 @@ class RacerAutomaton:
         if max_num_draft <= 0:
             return []
 
-        # (token, parent_position, breadth, depth)
         q: list[tuple[int, int, int, int]] = [
             (int(next_token), -1, 1 if is_chain else self.topk, 0)
         ]
@@ -239,9 +231,6 @@ class RacerAutomaton:
 
             if remaining > 0 and breadth > 0:
                 row = self._token_bin_row(token)
-                # Exact C++ rule:
-                #   depth == 1 -> preserve current breadth for first child
-                #   otherwise  -> halve before the first child
                 next_breadth = breadth if depth == 1 else (breadth >> 1)
                 next_depth = depth + 1
                 added = 0
@@ -250,12 +239,7 @@ class RacerAutomaton:
                         break
                     child = int(row[i])
                     q.append(
-                        (
-                            child,
-                            pos_u,
-                            max(1, next_breadth),
-                            next_depth,
-                        )
+                        (child, pos_u, max(1, next_breadth), next_depth)
                     )
                     next_breadth >>= 1
                     remaining -= 1
@@ -263,7 +247,6 @@ class RacerAutomaton:
                 if added:
                     continue
 
-            # Leaf: recover root -> leaf candidate from parent indices.
             candidate: list[int] = []
             cur = pos_u
             while cur >= 0:
@@ -303,15 +286,12 @@ class RacerAutomaton:
     def _select_retrieval_nodes(
         self, borders: Sequence[_TrieNode], budget: int
     ) -> list[tuple[_TrieNode, _TrieNode]]:
-        """Equivalent final selection to the C++ frequency/depth top-k heap."""
-
         scored: list[tuple[int, int, int, _TrieNode, _TrieNode]] = []
         serial = 0
         for border in borders:
             q = deque([border])
             while q:
                 node = q.popleft()
-                # Higher freq wins; for equal freq shallower depth wins.
                 scored.append((-node.freq, node.depth, serial, node, border))
                 serial += 1
                 q.extend(node.children.values())
@@ -346,20 +326,22 @@ class RacerAutomaton:
 
         return paths
 
+    def _record_proposal_shape(self, **kwargs) -> None:
+        """Instrumentation hook; overridden only when RACER stats are enabled."""
+        return None
+
     def _defensive_pad(self, trie: _CandidateTrie, budget: int, root_token: int) -> None:
         if trie.node_count >= budget:
             return
         if not self._warned_padding:
             logger.warning(
-                "RACER proposal produced %d/%d nodes; applying defensive fixed-K padding. "
-                "Normal RetrievalTree+TokenBin generation should already fill the budget.",
+                "RACER proposal produced %d/%d unique nodes after TokenBin refill; "
+                "applying defensive fixed-K padding.",
                 trie.node_count,
                 budget,
             )
             self._warned_padding = True
 
-        # Follow the TokenBin top-1 continuation so padding remains a valid token
-        # path. This is a last-resort ABI guard, not part of normal RACER proposal.
         path = [int(root_token)]
         token = int(root_token)
         guard = 0
@@ -369,14 +351,10 @@ class RacerAutomaton:
             path.append(token)
             before = trie.node_count
             trie.insert(path, budget)
-            if trie.node_count == before:
-                # Duplicate path: extend it once more on the same continuation.
-                guard += 1
-                continue
             guard += 1
+            if trie.node_count == before:
+                continue
 
-        # Extremely defensive fallback for a pathological self-looping TokenBin.
-        # Valid token 0 mirrors an uninitialized C++ TokenBin row.
         while trie.node_count < budget:
             path.append(0)
             trie.insert(path, budget)
@@ -384,7 +362,7 @@ class RacerAutomaton:
     def retrieve(
         self, root_token: int, max_num_draft: int
     ) -> tuple[list[int], list[list[bool]]]:
-        """Port of Automaton::retrieve for the default non-chain RACER mode."""
+        """RACER proposal plus a fixed-K TokenBin hole-refill pass."""
 
         budget = int(max_num_draft)
         if budget <= 0:
@@ -398,18 +376,54 @@ class RacerAutomaton:
         for path in self._selected_paths(selected):
             candidate_trie.insert(path, budget)
 
-        # Original RACER spends the remainder of the K-node budget on TokenBin.
-        remaining = budget - len(selected)
-        for path in self._token_bin_retrieve(root_token, remaining, is_chain=False):
-            candidate_trie.insert(path, budget)
+        retrieval_unique_nodes = candidate_trie.node_count
+        merge_holes = max(0, len(selected) - retrieval_unique_nodes)
 
-        # Original fallback when only the implicit trie root exists.
+        # First pass: exact original C++ RACER budget split.
+        original_tokenbin_budget = budget - len(selected)
+        original_tokenbin_paths = self._token_bin_retrieve(
+            root_token, original_tokenbin_budget, is_chain=False
+        )
+        for path in original_tokenbin_paths:
+            candidate_trie.insert(path, budget)
+        nodes_after_original_tokenbin = candidate_trie.node_count
+
+        # SGLang fixed-K adaptation: if pre-merge accounting left holes, run a
+        # full TokenBin proposal and merge only previously unseen token paths.
+        refill_used = candidate_trie.node_count < budget
+        refill_paths = 0
+        if refill_used:
+            full_tokenbin_paths = self._token_bin_retrieve(
+                root_token, budget, is_chain=False
+            )
+            refill_paths = len(full_tokenbin_paths)
+            for path in full_tokenbin_paths:
+                candidate_trie.insert(path, budget)
+                if candidate_trie.node_count >= budget:
+                    break
+
+        nodes_after_refill = candidate_trie.node_count
+
         if candidate_trie.node_count == 0:
             candidate_trie.insert([root_token], budget)
 
-        # SGLang's current NGRAM verify ABI requires exactly K flattened nodes.
-        # This should be unreachable in the normal RACER path, but keep a guard
-        # for duplicate merging / capacity edge cases instead of crashing serving.
+        nodes_before_padding = candidate_trie.node_count
+        padding_nodes = max(0, budget - nodes_before_padding)
+        self._record_proposal_shape(
+            borders=len(borders),
+            retrieval_selected=len(selected),
+            retrieval_unique_nodes=retrieval_unique_nodes,
+            merge_holes=merge_holes,
+            tokenbin_budget=original_tokenbin_budget,
+            tokenbin_paths=len(original_tokenbin_paths),
+            nodes_after_original_tokenbin=nodes_after_original_tokenbin,
+            refill_used=int(refill_used),
+            refill_paths=refill_paths,
+            nodes_after_refill=nodes_after_refill,
+            nodes_before_padding=nodes_before_padding,
+            padding_nodes=padding_nodes,
+        )
+
         self._defensive_pad(candidate_trie, budget, root_token)
 
         tokens, mask = candidate_trie.flatten(budget)
