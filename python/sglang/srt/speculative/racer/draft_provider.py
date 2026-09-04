@@ -18,15 +18,23 @@ class RacerDraftProvider:
     """Adapter boundary between RACER proposal construction and SGLang verify.
 
     The first integration stage intentionally delegates proposal generation to
-    the existing NGRAM corpus so that the worker behavior stays unchanged. The
-    RACER Aho-Corasick and logits-tree merge can replace this provider's
-    ``batch_get`` implementation later without touching SGLang's tree-mask,
-    TARGET_VERIFY, sampling, or KV-commit plumbing.
+    the existing NGRAM corpus so that worker behavior stays unchanged. The
+    provider proxies the rest of the corpus API, which lets ``RACERWorker``
+    reuse SGLang's existing NGRAM lifecycle, tree-mask preparation,
+    TARGET_VERIFY, sampling, and KV-commit plumbing without modifying
+    ``NGRAMWorker`` itself.
+
+    RACER's Aho-Corasick and logits-tree merge can later replace ``batch_get``
+    while keeping the surrounding execution path intact.
     """
 
     def __init__(self, source: _DraftSource, draft_token_num: int):
         self._source = source
         self.draft_token_num = draft_token_num
+
+    def __getattr__(self, name: str):
+        """Forward non-drafting corpus operations to the wrapped source."""
+        return getattr(self._source, name)
 
     def batch_get(
         self,
